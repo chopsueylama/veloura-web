@@ -1,14 +1,15 @@
 // app/api/chat/route.ts
-import type { NextRequest } from "next/server";
+import { NextRequest } from "next/server";
 
-/** Parse Ollama NDJSON and stream only the `response` field as plain text */
-function streamOllamaToClient(res: Response): ReadableStream<Uint8Array> {
-  if (!res.body) throw new Error("Upstream had no body");
+export const runtime = "nodejs"; // don't use 'edge' for HTTP calls to Ollama
+
+function streamOllamaToClient(res: Response) {
+  if (!res.body) throw new Error("No body from Ollama");
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
 
-  return new ReadableStream<Uint8Array>({
+  return new ReadableStream({
     async pull(controller) {
       const { done, value } = await reader.read();
       if (done) {
@@ -16,19 +17,16 @@ function streamOllamaToClient(res: Response): ReadableStream<Uint8Array> {
         return;
       }
       const chunk = decoder.decode(value, { stream: true });
-
-      // Ollama returns NDJSON (one JSON object per line)
       for (const line of chunk.split("\n")) {
         const s = line.trim();
         if (!s) continue;
         try {
           const j = JSON.parse(s);
-          // Stream only the model's text tokens
           if (typeof j?.response === "string") {
             controller.enqueue(encoder.encode(j.response));
           }
         } catch {
-          // ignore partial JSON lines
+          // ignore partial/incomplete NDJSON lines
         }
       }
     },
@@ -38,92 +36,77 @@ function streamOllamaToClient(res: Response): ReadableStream<Uint8Array> {
   });
 }
 
-/** Small CORS-friendly headers for fetch/clients */
-const COMMON_HEADERS = {
-  "Content-Type": "text/plain; charset=utf-8",
-  "Cache-Control": "no-store, no-transform",
-  "X-Accel-Buffering": "no", // friendlier for proxies
-} as const;
-
 export async function POST(req: NextRequest) {
+  // Read prompt from JSON or raw body
+  let prompt = "";
   try {
-    // 1) Read prompt from JSON {prompt} or raw text
-    let prompt = "";
-    try {
-      const ct = req.headers.get("content-type") || "";
-      if (ct.includes("application/json")) {
-        const body = await req.json();
-        prompt = (body?.prompt ?? body?.message ?? "").toString();
-      } else {
-        prompt = (await req.text()).toString();
-      }
-    } catch {
-      // fall through; prompt might remain ""
+    const ct = req.headers.get("content-type") || "";
+    if (ct.includes("application/json")) {
+      const body = await req.json();
+      prompt = (body?.prompt ?? body?.message ?? "").toString();
+    } else {
+      prompt = (await req.text()).toString();
     }
+  } catch {
+    /* ignore */
+  }
 
-    if (!prompt?.trim()) {
-      return new Response("No prompt provided.", { status: 400 });
-    }
+  if (!prompt.trim()) {
+    return new Response("No prompt provided.", { status: 400 });
+  }
 
-    // 2) Resolve model + base URL from env (safe defaults)
-    const model = process.env.LOCAL_MODEL?.trim() || "phi3:mini";
+  // Choose base URL by environment
+  const isProd =
+    process.env.VERCEL_ENV === "production" ||
+    process.env.NODE_ENV === "production";
 
-    // Use your Cloudflare tunnel (or local Ollama) as the base
-    const baseUrl =
-      process.env.LOCAL_AI_URL?.trim() ||
-      // final fallback so build never crashes (replace with your current tunnel)
-      "https://schedule-seed-provinces-accomplish.trycloudflare.com";
+  const baseUrl = isProd
+    ? process.env.PROD_AI_URL
+    : process.env.LOCAL_AI_URL;
 
-    if (!baseUrl) {
-      return new Response(
-        "LOCAL_AI_URL is not set. Add it in your Vercel env or .env file.",
-        { status: 500 }
-      );
-    }
+  const model = isProd
+    ? process.env.PROD_MODEL || "phi3:mini"
+    : process.env.LOCAL_MODEL || "phi3:mini";
 
-    const url = `${baseUrl.replace(/\/$/, "")}/api/generate`;
+  if (!baseUrl) {
+    return new Response("AI base URL not configured.", { status: 500 });
+  }
 
-    // 3) Call Ollama with stream=true so we can forward tokens
+  const url = `${baseUrl.replace(/\/+$/, "")}/api/generate`;
+  // console.log(`[CHAT] Mode: ${isProd ? "prod" : "local"} | URL: ${url} | Model: ${model}`);
+
+  try {
     const upstream = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model,
-        prompt,
-        stream: true,
-      }),
+      // stream=true is required for token streaming
+      body: JSON.stringify({ model, prompt, stream: true }),
     });
 
     if (!upstream.ok) {
-      const body = await upstream.text().catch(() => "");
-      console.error("[CHAT] Ollama error", upstream.status, body);
-      return new Response(`Ollama error ${upstream.status}: ${body}`, {
+      const text = await upstream.text();
+      // Pass through the upstream error text so you can see it in curl
+      return new Response(`Upstream error ${upstream.status}: ${text}`, {
         status: 502,
-        headers: COMMON_HEADERS,
+        headers: { "Content-Type": "text/plain; charset=utf-8" },
       });
     }
 
-    // 4) Stream NDJSON -> plain text back to the client
     const stream = streamOllamaToClient(upstream);
-    return new Response(stream, { status: 200, headers: COMMON_HEADERS });
-  } catch (e: any) {
-    console.error("[CHAT] Server error:", e?.message || e);
-    return new Response(`Server error: ${e?.message || e}`, {
-      status: 500,
-      headers: COMMON_HEADERS,
+
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+        "X-Accel-Buffering": "no",
+      },
     });
+  } catch (e: any) {
+    return new Response(`Server error: ${e?.message || e}`, { status: 500 });
   }
 }
 
-/** Optional: handle CORS preflight (if you embed from other domains) */
-export function OPTIONS() {
-  return new Response(null, {
-    status: 204,
-    headers: {
-      ...COMMON_HEADERS,
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
-      "Access-Control-Allow-Methods": "POST, OPTIONS",
-    },
-  });
+// Explicitly reject GET to avoid HTML errors when you browse to it
+export async function GET() {
+  return new Response("Method Not Allowed", { status: 405 });
 }
